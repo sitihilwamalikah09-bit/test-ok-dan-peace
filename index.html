@@ -1,3 +1,226 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <title>Rabbit & Fox - Gesture micro:bit</title>
+    <!-- Load MediaPipe & Camera Utils -->
+    <script src="https://jsdelivr.net" crossorigin="anonymous"></script>
+    <script src="https://jsdelivr.net" crossorigin="anonymous"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .buttons { margin-bottom: 10px; }
+        button { padding: 10px; margin-right: 5px; cursor: pointer; }
+        #video-container { position: relative; width: 480px; height: 360px; background: #000; }
+        video { width: 100%; height: 100%; transform: scaleX(-1); }
+        .status { margin-top: 15px; padding: 10px; border: 1px solid #ccc; width: 460px; }
+    </style>
+</head>
+<body>
+
+    <h2>🤍 Kontrol & Status</h2>
+    <div class="buttons">
+        <button id="btn-connect">Hubungkan micro:bit</button>
+        <button id="btn-disconnect">Putuskan Koneksi</button>
+        <button id="btn-start-cam">Mulai Kamera</button>
+        <button id="btn-stop-cam">Stop Kamera</button>
+    </div>
+
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline></video>
+    </div>
+
+    <div class="status">
+        <p><b>Bluetooth:</b> <span id="status-bt">Belum Terhubung</span></p>
+        <p><b>Kamera:</b> <span id="status-cam">Kati</span></p>
+        <p><b>Deteksi Saat Ini:</b> <span id="status-detect">-</span></p>
+        <p><b>Perintah Terakhir:</b> <span id="status-command">-</span></p>
+    </div>
+
+<script>
+// === KONFIGURASI WEB BLUETOOTH (micro:bit UART Service) ===
+const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const TX_CHARACTERISTIC_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // TX dari sisi microbit, RX bagi web
+
+let bluetoothDevice = null;
+let txCharacteristic = null;
+
+// === STATE LOGIKA GESTUR ===
+let currentGesture = "-";
+let gestureStartTime = null;
+let isLocked = false;
+let lockTimeout = null;
+
+// Konfigurasi durasi sesuai aturan website
+const STABLE_DURATION = 700; // 0.7 detik stabil
+const UNLOCK_DURATION = 1500; // 1.5 detik kosong untuk buka kunci
+
+// Elements
+const videoElement = document.getElementById('webcam');
+const btnConnect = document.getElementById('btn-connect');
+const btnDisconnect = document.getElementById('btn-disconnect');
+const btnStartCam = document.getElementById('btn-start-cam');
+const btnStopCam = document.getElementById('btn-stop-cam');
+
+const statusBt = document.getElementById('status-bt');
+const statusCam = document.getElementById('status-cam');
+const statusDetect = document.getElementById('status-detect');
+const statusCommand = document.getElementById('status-command');
+
+// === 1. FUNGSI BLUETOOTH (Koneksi ke micro:bit) ===
+async function connectMicrobit() {
+    try {
+        statusBt.innerText = "Menghubungkan...";
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'BBC micro:bit' }],
+            optionalServices: [UART_SERVICE_UUID]
+        });
+
+        const server = await bluetoothDevice.gatt.connect();
+        const service = await server.getPrimaryService(UART_SERVICE_UUID);
+        txCharacteristic = await service.getCharacteristic(TX_CHARACTERISTIC_UUID);
+
+        statusBt.innerText = "Terhubung";
+        alert("micro:bit berhasil terhubung!");
+    } catch (error) {
+        console.error(error);
+        statusBt.innerText = "Gagal Terhubung";
+    }
+}
+
+function disconnectMicrobit() {
+    if (bluetoothDevice && bluetoothDevice.gatt.connected) {
+        bluetoothDevice.gatt.disconnect();
+        statusBt.innerText = "Belum Terhubung";
+        alert("Koneksi diputuskan.");
+    }
+}
+
+// Mengirim data teks ke micro:bit
+async function sendToMicrobit(text) {
+    if (!txCharacteristic) return;
+    try {
+        const encoder = new TextEncoder();
+        // Menambahkan delimiter newline (\n) agar micro:bit tahu batas teksnya
+        await txCharacteristic.writeValue(encoder.encode(text + "\n"));
+        statusCommand.innerText = text;
+        console.log("Data dikirim:", text);
+    } catch (error) {
+        console.error("Gagal mengirim data:", error);
+    }
+}
+
+// === 2. FUNGSI GEOMETRI & DETEKSI GESTUR (Rule-Based) ===
+function analyzeGesture(landmarks) {
+    // Menghitung apakah jari tegak (ujung jari lebih tinggi dari sendi bawahnya)
+    // Ingat koordinat Y MediaPipe: 0 di atas, 1 di bawah. Jadi makin kecil Y, makin tinggi posisinya.
+    const thumbExtended = landmarks[4].x < landmarks[3].x; // Sederhana untuk jempol
+    const indexExtended = landmarks[8].y < landmarks[6].y;
+    const middleExtended = landmarks[12].y < landmarks[10].y;
+    const ringExtended = landmarks[16].y < landmarks[14].y;
+    const pinkyExtended = landmarks[20].y < landmarks[18].y;
+
+    // Gestur PEACE (Telunjuk & Tengah tegak, Manis & Kelingking tertekuk)
+    if (indexExtended && middleExtended && !ringExtended && !pinkyExtended) {
+        return "peace";
+    }
+    
+    // Gestur OKE (Semua jari terbuka/tegak) - Sesuai visual telapak tangan terbuka ✋
+    if (indexExtended && middleExtended && ringExtended && pinkyExtended) {
+        return "oke";
+    }
+
+    return "-";
+}
+
+// === 3. LOGIKA WAKTU (0.7s Stabil & Lock 1.5s) ===
+function processGestureLogic(detected) {
+    statusDetect.innerText = detected;
+
+    if (detected === "-") {
+        gestureStartTime = null;
+        // Jika tangan dijauhkan / tidak ada gestur selama 1.5 detik, buka kunci
+        if (isLocked && !lockTimeout) {
+            lockTimeout = setTimeout(() => {
+                isLocked = false;
+                lockTimeout = null;
+                statusCommand.innerText = "Siaga (Kunci Terbuka)";
+            }, UNLOCK_DURATION);
+        }
+        return;
+    }
+
+    // Jika mendeteksi sesuatu, batalkan ancangan membuka kunci
+    if (lockTimeout) {
+        clearTimeout(lockTimeout);
+        lockTimeout = null;
+    }
+
+    // Jika status sedang terkunci, abaikan deteksi baru
+    if (isLocked) return;
+
+    // Logika kestabilan gestur (0.7 detik)
+    if (detected === currentGesture) {
+        const duration = Date.now() - gestureStartTime;
+        if (duration >= STABLE_DURATION) {
+            // Kirim data sekali saja
+            sendToMicrobit(detected);
+            isLocked = true; // Kunci sistem
+            currentGesture = "-";
+            gestureStartTime = null;
+        }
+    } else {
+        // Reset pencatat waktu jika gestur berubah-ubah
+        currentGesture = detected;
+        gestureStartTime = Date.now();
+    }
+}
+
+// === 4. KONFIGURASI MEDIAPIPE HANDS & KAMERA ===
+const hands = new Hands({
+    locateFile: (file) => `https://jsdelivr.net{file}`
+});
+
+hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.8, // Akurasi tinggi sesuai syarat website (>=90% / 0.8)
+    minTrackingConfidence: 0.5
+});
+
+hands.onResults((results) => {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const gesture = analyzeGesture(results.multiHandLandmarks[0]);
+        processGestureLogic(gesture);
+    } else {
+        processGestureLogic("-");
+    }
+});
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        await hands.send({ image: videoElement });
+    },
+    width: 480,
+    height: 360
+});
+
+// === 5. EVENT LISTENERS ===
+btnConnect.addEventListener('click', connectMicrobit);
+btnDisconnect.addEventListener('click', disconnectMicrobit);
+
+btnStartCam.addEventListener('click', () => {
+    camera.start();
+    statusCam.innerText = "Kamera Aktif";
+});
+
+btnStopCam.addEventListener('click', () => {
+    videoElement.srcObject.getTracks().forEach(track => track.stop());
+    statusCam.innerText = "Kamera Mati";
+    processGestureLogic("-");
+});
+</script>
+</body>
+</html>
 
 <!DOCTYPE html>
 <html lang="id">
